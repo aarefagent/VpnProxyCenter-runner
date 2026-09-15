@@ -1,0 +1,68 @@
+name: vpnproxy-failover
+
+# BACKUP RUNNER ONLY — the main Hermes server is the primary poster.
+# This workflow fires every 30 min but posts ONLY if @VpnProxyCenter has
+# been silent for 3+ hours (watchdog.py). Otherwise it exits in seconds.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  failover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch latest scripts from backup repo
+        run: |
+          BASE=https://raw.githubusercontent.com/aarefagent/Hermesbackup/main
+          mkdir -p scripts vpnbot
+          for f in vpnproxy_scheduler.py send_configs.py; do
+            curl -sSL --max-time 60 "$BASE/hermes-scripts/$f" -o "scripts/$f"
+          done
+          for f in scraper.py bot.py formatter.py parser.py config.py github_sources.py; do
+            curl -sSL --max-time 60 "$BASE/vpnproxy-bot/$f" -o "vpnbot/$f"
+          done
+          pip install -q requests pyyaml
+          python3 -m py_compile scripts/*.py vpnbot/*.py watchdog.py seed_state.py
+
+      - name: Watchdog (skip if main server alive)
+        id: guard
+        run: |
+          if python3 watchdog.py; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Seed dedup state from channel + run scheduler once
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          VPNBOT_STATE: ${{ github.workspace }}/state/posted_configs.json
+          PYTHONPATH: ${{ github.workspace }}/vpnbot
+        run: |
+          mkdir -p state
+          python3 seed_state.py state/posted_configs.json
+          cp vpnbot/*.py scripts/ 2>/dev/null || true
+          # scheduler imports vpnproxy-bot dir; point it at our copy
+          sed -i 's|sys.path.insert(0, "/data/workspace/vpnproxy-bot")|sys.path.insert(0, "scripts")|' scripts/vpnproxy_scheduler.py
+          cd scripts && python3 vpnproxy_scheduler.py; cd ..
+
+      - name: Commit state back
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          git config user.name "failover-bot"
+          git config user.email "failover-bot@local"
+          git add state/ || true
+          git diff --cached --quiet || git commit -m "failover state $(date -u +%F_%H-%M)"
+          git push || echo "push skipped (nothing new or conflict)"
